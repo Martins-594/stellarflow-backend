@@ -21,6 +21,7 @@ import struct
 from unittest.mock import mock_open, patch
 
 import sys
+import pytest
 
 # ---------------------------------------------------------------------------
 # Path bootstrap
@@ -42,6 +43,9 @@ from utils.sandbox import (  # noqa: E402
     sandbox_policy,
     seccomp_available,
     seccomp_guard,
+    sanitize_environment,
+    get_default_env_whitelist,
+    _SECCOMP_RET_TRAP,
 )
 
 
@@ -133,6 +137,21 @@ class TestBPFBuilder:
         assert code == _BPF_RET_K
         # k should be SECCOMP_RET_ERRNO | errno_val
         assert k == (0x00050000 | 1)
+
+    def test_block_syscall_with_trap(self) -> None:
+        """Block a syscall with SIGSYS trap."""
+        bpf = BPFBuilder(_AUDIT_ARCH_X86_64)
+        bpf.block_syscall_with_trap(Syscall.CREAT)
+        # preamble(4) + jeq(1) + ret_trap(1) = 6
+        assert bpf.filter_count() == 6
+
+        bytecode = bpf.compile()
+        # Find the RET instruction for creat
+        ins = bytecode[5 * 8 : 6 * 8]
+        code, jt, jf, k = struct.unpack("<HBBI", ins)
+        assert code == _BPF_RET_K
+        # k should be SECCOMP_RET_TRAP
+        assert k == _SECCOMP_RET_TRAP
 
     def test_allow_open_read_only_instruction_count(self) -> None:
         """The allow_open_read_only helper produces a reasonable number of instructions."""
@@ -515,3 +534,123 @@ class TestEdgeCases:
         policy = SandboxPolicy(min_bytes, name="empty")
         assert policy.name == "empty"
         assert not policy.applied
+
+
+# ===========================================================================
+# Environment Variable Whitelisting
+# ===========================================================================
+
+
+class TestEnvironmentSanitization:
+    """Tests for environment variable whitelisting and sanitization."""
+
+    def test_sanitize_environment_uses_default_whitelist(self) -> None:
+        """When no whitelist provided, use the default safe whitelist."""
+        # Set some environment variables
+        test_env = {
+            "PATH": "/usr/bin:/bin",
+            "HOME": "/home/user",
+            "SECRET_KEY": "super_secret",  # Should be filtered out
+            "API_TOKEN": "token123",  # Should be filtered out
+        }
+        
+        sanitized = sanitize_environment(test_env)
+        
+        # Only whitelisted variables should remain
+        assert "PATH" in sanitized
+        assert "HOME" in sanitized
+        assert "SECRET_KEY" not in sanitized
+        assert "API_TOKEN" not in sanitized
+
+    def test_sanitize_environment_with_custom_whitelist(self) -> None:
+        """Custom whitelist overrides default whitelist."""
+        test_env = {
+            "PATH": "/usr/bin",
+            "CUSTOM_VAR": "custom_value",
+            "SECRET": "secret",
+        }
+        
+        custom_whitelist = frozenset(["CUSTOM_VAR"])
+        sanitized = sanitize_environment(test_env, whitelist=custom_whitelist)
+        
+        # Only custom whitelisted variable should remain
+        assert "CUSTOM_VAR" in sanitized
+        assert "PATH" not in sanitized  # Not in custom whitelist (overrides default)
+        assert "SECRET" not in sanitized
+
+    def test_sanitize_environment_merges_whitelist_and_allowlist(self) -> None:
+        """Both whitelist and allowlist parameters are merged."""
+        test_env = {
+            "VAR1": "value1",
+            "VAR2": "value2",
+            "VAR3": "value3",
+        }
+        
+        whitelist = frozenset(["VAR1"])
+        allowlist = frozenset(["VAR2"])
+        sanitized = sanitize_environment(test_env, whitelist=whitelist, allowlist=allowlist)
+        
+        # Both VAR1 and VAR2 should be present
+        assert "VAR1" in sanitized
+        assert "VAR2" in sanitized
+        assert "VAR3" not in sanitized
+
+    def test_sanitize_environment_uses_os_environ_when_none(self) -> None:
+        """When env is None, use os.environ as source."""
+        # This test uses the actual process environment
+        sanitized = sanitize_environment()
+        
+        # Should only contain whitelisted variables from actual environment
+        for key in sanitized:
+            assert key in get_default_env_whitelist()
+
+    def test_sanitize_environment_rejects_non_string_whitelist_keys(self) -> None:
+        """Whitelist with non-string keys should raise TypeError."""
+        with pytest.raises(TypeError, match="whitelist must contain only string keys"):
+            sanitize_environment(whitelist=frozenset([123, "PATH"]))
+
+    def test_sanitize_environment_rejects_non_string_allowlist_keys(self) -> None:
+        """Allowlist with non-string keys should raise TypeError."""
+        with pytest.raises(TypeError, match="allowlist must contain only string keys"):
+            sanitize_environment(allowlist=frozenset([456, "HOME"]))
+
+    def test_get_default_env_whitelist_returns_frozenset(self) -> None:
+        """Default whitelist should be a frozenset."""
+        whitelist = get_default_env_whitelist()
+        assert isinstance(whitelist, frozenset)
+        assert len(whitelist) > 0
+
+    def test_default_whitelist_contains_safe_variables(self) -> None:
+        """Default whitelist should contain known safe variables."""
+        whitelist = get_default_env_whitelist()
+        assert "PATH" in whitelist
+        assert "HOME" in whitelist
+        assert "USER" in whitelist
+        assert "LANG" in whitelist
+
+    def test_sanitize_environment_preserves_values(self) -> None:
+        """Sanitized environment should preserve original values."""
+        test_env = {
+            "PATH": "/usr/bin:/bin",
+            "HOME": "/home/testuser",
+        }
+        
+        sanitized = sanitize_environment(test_env)
+        
+        assert sanitized["PATH"] == "/usr/bin:/bin"
+        assert sanitized["HOME"] == "/home/testuser"
+
+    def test_sanitize_environment_returns_new_dict(self) -> None:
+        """Should return a new dictionary, not modify the original."""
+        test_env = {"PATH": "/usr/bin", "SECRET": "secret"}
+        original_len = len(test_env)
+        
+        sanitized = sanitize_environment(test_env)
+        
+        # Original should be unchanged
+        assert len(test_env) == original_len
+        assert "SECRET" in test_env
+        
+        # Sanitized should be different
+        assert "SECRET" not in sanitized
+        assert sanitized is not test_env

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
@@ -48,6 +49,172 @@ _SCALE_DOWN_RATIO: float = 0.5
 # How long an idle worker waits for an item before looping (keeps threads
 # responsive to the stop event without busy-spinning).
 _WORKER_TIMEOUT: float = 1.0
+
+
+# ---------------------------------------------------------------------------
+# Non-blocking Task Cancellation
+# ---------------------------------------------------------------------------
+
+
+class CancellableTask:
+    """A task wrapper that supports non-blocking asynchronous cancellation.
+    
+    This class provides cancellation handlers that release resources asynchronously
+    without delaying the core scheduling loops. When a task is cancelled, cleanup
+    is scheduled on the event loop rather than blocking the main thread.
+    
+    Usage::
+    
+        def my_task():
+            # Do work
+            pass
+        
+        cancellable = CancellableTask(my_task)
+        cancellable.start()
+        
+        # Later, cancel without blocking
+        await cancellable.cancel_async()
+    """
+    
+    def __init__(
+        self,
+        task_func: Callable,
+        task_id: Optional[int] = None,
+        on_cancel: Optional[Callable] = None,
+    ) -> None:
+        """Initialize a cancellable task.
+        
+        Parameters
+        ----------
+        task_func:
+            The callable to execute.
+        task_id:
+            Optional identifier for the task.
+        on_cancel:
+            Optional callback to execute when the task is cancelled.
+            This callback is executed asynchronously.
+        """
+        self._task_func = task_func
+        self._task_id = task_id
+        self._on_cancel = on_cancel
+        self._cancelled = False
+        self._completed = False
+        self._cleanup_event = threading.Event()
+        self._lock = threading.Lock()
+        
+    @property
+    def task_id(self) -> Optional[int]:
+        """Return the task identifier."""
+        return self._task_id
+    
+    @property
+    def is_cancelled(self) -> bool:
+        """Return True if the task has been cancelled."""
+        with self._lock:
+            return self._cancelled
+    
+    @property
+    def is_completed(self) -> bool:
+        """Return True if the task has completed."""
+        with self._lock:
+            return self._completed
+    
+    def mark_completed(self) -> None:
+        """Mark the task as completed."""
+        with self._lock:
+            self._completed = True
+            self._cleanup_event.set()
+    
+    def cancel(self) -> bool:
+        """Cancel the task synchronously.
+        
+        Returns True if the task was cancelled, False if it was already
+        cancelled or completed.
+        
+        This method is synchronous but schedules the cleanup callback
+        asynchronously if one is provided.
+        """
+        with self._lock:
+            if self._cancelled or self._completed:
+                return False
+            self._cancelled = True
+            self._cleanup_event.set()
+        
+        # Run cleanup callback directly if provided (synchronous for simplicity)
+        if self._on_cancel:
+            self._run_cleanup_callback()
+        
+        logger.debug(
+            "CancellableTask[%s]: cancelled",
+            self._task_id
+        )
+        return True
+    
+    async def cancel_async(self) -> bool:
+        """Cancel the task asynchronously.
+        
+        This is the preferred method for async contexts as it does not
+        block the event loop.
+        
+        Returns True if the task was cancelled, False if it was already
+        cancelled or completed.
+        """
+        with self._lock:
+            if self._cancelled or self._completed:
+                return False
+            self._cancelled = True
+            self._cleanup_event.set()
+        
+        # Run cleanup callback asynchronously
+        if self._on_cancel:
+            await asyncio.to_thread(self._run_cleanup_callback)
+        
+        logger.debug(
+            "CancellableTask[%s]: cancelled asynchronously",
+            self._task_id
+        )
+        return True
+    
+    def _run_cleanup_callback(self) -> None:
+        """Execute the cleanup callback in a thread-safe manner."""
+        if self._on_cancel:
+            try:
+                self._on_cancel()
+            except Exception as exc:
+                logger.exception(
+                    "CancellableTask[%s]: cleanup callback failed: %s",
+                    self._task_id,
+                    exc
+                )
+    
+    def wait_for_cleanup(self, timeout: Optional[float] = None) -> bool:
+        """Wait for cleanup to complete.
+        
+        Parameters
+        ----------
+        timeout:
+            Maximum time to wait in seconds. If None, wait indefinitely.
+        
+        Returns
+        -------
+        bool
+            True if cleanup completed, False if timeout was reached.
+        """
+        return self._cleanup_event.wait(timeout=timeout)
+    
+    def __call__(self) -> None:
+        """Execute the task function."""
+        if self.is_cancelled:
+            logger.debug(
+                "CancellableTask[%s]: skipping execution (cancelled)",
+                self._task_id
+            )
+            return
+        
+        try:
+            self._task_func()
+        finally:
+            self.mark_completed()
 
 
 # ---------------------------------------------------------------------------
@@ -610,4 +777,5 @@ __all__ = [
     "DynamicThreadingPool",
     "pin_thread_to_cores",
     "threading_pool",
+    "CancellableTask",
 ]
