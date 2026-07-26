@@ -4,9 +4,9 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "dev": "tsx watch src/index.ts",
-    "build": "tsc",
-    "start": "node dist/index.js",
+    "dev": "node api.js && tsx watch src/index.ts",
+    "build": "node api.js && tsc",
+    "start": "node api.js && node dist/index.js",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "format": "prettier . --write",
@@ -92,7 +92,6 @@
     "winston-daily-rotate-file": "^5.0.0"
   },
   "devDependencies": {
-    "@types/bcrypt": "^5.0.2",
     "@types/bcrypt": "^5.0.2",
     "@types/compression": "^1.8.1",
     "@types/express": "^5.0.6",
