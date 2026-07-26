@@ -85,6 +85,7 @@ _SECCOMP_RET_KILL_PROCESS: int = 0x80000000
 _SECCOMP_RET_KILL_THREAD: int = 0x00000000
 _SECCOMP_RET_ALLOW: int = 0x7FFF0000
 _SECCOMP_RET_ERRNO: int = 0x00050000
+_SECCOMP_RET_TRAP: int = 0x00030000  # Raises SIGSYS
 
 # BPF instruction classes
 _BPF_LD: int = 0x00
@@ -782,6 +783,17 @@ class BPFBuilder:
         self._emit(_BPF_RET_K, 0, 0, _SECCOMP_RET_ERRNO | (errno_val & 0xFFFF))
         return self
 
+    def block_syscall_with_trap(self, nr: int) -> BPFBuilder:
+        """Block *nr* by raising SIGSYS signal.
+        
+        This is the preferred method for security-critical blocking as it
+        immediately raises a signal that can be caught and logged, making
+        syscall violations visible to monitoring systems.
+        """
+        self._emit(_BPF_JMP_JEQ_K, 0, 1, nr)
+        self._emit(_BPF_RET_K, 0, 0, _SECCOMP_RET_TRAP)
+        return self
+
     def allow_open_read_only(self) -> BPFBuilder:
         """Allow ``open(2)`` only when the flags argument specifies ``O_RDONLY``.
 
@@ -883,8 +895,8 @@ def _build_ingestion_filter() -> bytes:
     - ``open(2)`` / ``openat(2)`` allowed ONLY with ``O_RDONLY`` — write
       modes (``O_WRONLY``, ``O_RDWR``) are killed.
     - ``creat(2)``, ``mkdir(2)``, ``unlink(2)``, and all other filesystem-
-      mutation syscalls are blocked.
-    - Privilege-escalation and kernel-modification syscalls are blocked.
+      mutation syscalls are blocked with SIGSYS.
+    - Privilege-escalation and kernel-modification syscalls are blocked with SIGSYS.
     - Default action: kill process.
     """
     bpf = BPFBuilder(_CURRENT_AUDIT_ARCH)
@@ -901,9 +913,9 @@ def _build_ingestion_filter() -> bytes:
     # 4. openat(2) — only O_RDONLY
     bpf.allow_openat_read_only()
 
-    # 5. Block unsafe syscalls with EPERM
+    # 5. Block unsafe syscalls with SIGSYS (raises signal for monitoring)
     for nr in sorted(_BLOCKED_SYSCALLS):
-        bpf.block_syscall_with_errno(nr)
+        bpf.block_syscall_with_trap(nr)
 
     return bpf.compile()
 
@@ -1016,6 +1028,120 @@ class SandboxPolicy:
     def __repr__(self) -> str:
         applied = "applied" if self._applied else "pending"
         return f"<SandboxPolicy name={self._name!r} state={applied} platform={'linux' if _is_linux else sys.platform}>"
+
+
+# ==========================================================================
+# Environment Variable Whitelisting
+# ==========================================================================
+
+
+# Default whitelist of safe environment variables for subprocess execution
+# These are explicitly allowed as they are necessary for normal operation
+_DEFAULT_ENV_WHITELIST: FrozenSet[str] = frozenset([
+    "PATH",                    # Executable search paths
+    "HOME",                    # User home directory
+    "USER",                    # Current username
+    "LANG",                    # Locale settings
+    "LC_ALL",                  # Locale override
+    "LC_CTYPE",                # Character encoding
+    "TERM",                    # Terminal type
+    "TZ",                      # Timezone
+    "PYTHONPATH",              # Python module search path (if needed)
+    "PYTHONUNBUFFERED",        # Python stdout/stderr buffering
+    "PYTHONIOENCODING",        # Python I/O encoding
+])
+
+
+def sanitize_environment(
+    env: Optional[dict[str, str]] = None,
+    whitelist: Optional[FrozenSet[str]] = None,
+    allowlist: Optional[FrozenSet[str]] = None,
+) -> dict[str, str]:
+    """Return a sanitized environment dictionary containing only whitelisted variables.
+
+    This function prevents passing un-sanitized parent process environment
+    variables to worker subprocesses, which could expose private secrets.
+
+    Parameters
+    ----------
+    env:
+        Source environment dictionary. If None, uses ``os.environ``.
+    whitelist:
+        Set of environment variable names to allow. If None, uses the
+        default safe whitelist. Note: ``allowlist`` is an alias for
+        ``whitelist`` for inclusive terminology. If provided, this overrides
+        the default whitelist.
+    allowlist:
+        Alias for ``whitelist``. If both are provided, they are merged.
+
+    Returns
+    -------
+    dict[str, str]
+        A new dictionary containing only the whitelisted environment variables.
+
+    Raises
+    ------
+    TypeError
+        If ``whitelist`` or ``allowlist`` contains non-string keys.
+
+    Example::
+
+        from src.utils.sandbox import sanitize_environment
+
+        # Use default whitelist
+        clean_env = sanitize_environment()
+
+        # Custom whitelist (overrides default)
+        clean_env = sanitize_environment(
+            whitelist=frozenset(["PATH", "HOME", "CUSTOM_VAR"])
+        )
+
+        # Pass to subprocess
+        subprocess.run(["command"], env=clean_env)
+    """
+    if env is None:
+        env = dict(os.environ)
+
+    # If custom whitelist is provided, use it instead of default
+    # Otherwise use default whitelist
+    if whitelist is not None:
+        if not all(isinstance(k, str) for k in whitelist):
+            raise TypeError("whitelist must contain only string keys")
+        allowed_vars = set(whitelist)
+    else:
+        allowed_vars = set(_DEFAULT_ENV_WHITELIST)
+    
+    # Merge allowlist if provided
+    if allowlist is not None:
+        if not all(isinstance(k, str) for k in allowlist):
+            raise TypeError("allowlist must contain only string keys")
+        allowed_vars.update(allowlist)
+
+    # Build sanitized environment
+    sanitized = {}
+    for key, value in env.items():
+        if key in allowed_vars:
+            sanitized[key] = value
+
+    logger.debug(
+        "sanitize_environment: allowed %d/%d variables (whitelist size=%d)",
+        len(sanitized),
+        len(env),
+        len(allowed_vars),
+    )
+
+    return sanitized
+
+
+def get_default_env_whitelist() -> FrozenSet[str]:
+    """Return the default environment variable whitelist.
+
+    Returns
+    -------
+    FrozenSet[str]
+        The default set of allowed environment variable names.
+    """
+    return _DEFAULT_ENV_WHITELIST
 
 
 # ==========================================================================
